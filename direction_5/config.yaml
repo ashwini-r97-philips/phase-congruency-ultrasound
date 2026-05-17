@@ -5,7 +5,7 @@ dataset:
   train_val_test_split: [0.75, 0.10, 0.15]
   random_seed: 42
   image_size: [256, 256]
-  num_workers: 4
+  num_workers: 2
 
 model:
   encoder_channels: [1, 32, 64, 128, 256]

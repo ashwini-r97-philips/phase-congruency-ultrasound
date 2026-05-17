@@ -67,7 +67,7 @@ class UNet(nn.Module):
         self.decoders = nn.ModuleList([
             DecoderBlock(
                 bottleneck_ch if i == 0 else dc[i - 1],
-                ec[-(i + 2)],
+                ec[-(i + 1)],
                 dc[i],
             )
             for i in range(len(dc))
