@@ -1,0 +1,61 @@
+dataset:
+  hf_path: "haifan-gong/TN3K"
+  local_root: null                        # set to local path to bypass HF
+  use_official_split: false               # true only when local_root has train/test dirs
+  train_val_test_split: [0.75, 0.10, 0.15]
+  random_seed: 42
+  image_size: [256, 256]
+  num_workers: 4
+
+model:
+  encoder_channels: [1, 32, 64, 128, 256]
+  decoder_channels: [256, 128, 64, 32]
+  num_classes: 1
+
+training:
+  epochs: 50
+  batch_size: 16
+  optimizer: adam
+  lr: 1.0e-3
+  weight_decay: 1.0e-4
+  lr_scheduler: cosine
+  loss: dice_ce
+  early_stopping_patience: 15
+  checkpoint_dir: "outputs/checkpoints"
+  predictions_dir: "outputs/predictions"
+
+evaluation:
+  threshold: 0.5
+  metrics_dir: "outputs/metrics"
+  hd95_backend: "simpleitk"              # fallback: scipy
+
+failure_analysis:
+  boundary_radii: [3, 5, 10]
+  output_dir: "outputs/metrics"
+
+phase_analysis:
+  pc:
+    n_scales: 4
+    n_orientations: 6
+    min_wavelength: 6
+    mult: 2.1
+    sigma_on_f: 0.55
+    k: 2.0
+    cutoff: 0.5
+    g: 10
+    noise_method: -1
+  pc_backend: "scipy"                    # scipy (built-in) or phasepack
+  canny_sigma: 2.0
+  sobel_ksize: 3
+  primary_band_r: 5
+  output_dir: "outputs/phase_maps"
+  metrics_dir: "outputs/metrics"
+  pc_quartile_bins: 4
+
+visualization:
+  output_dir: "outputs/figures"
+  gallery_n: 20
+  dpi: 150
+  panel_figsize: [20, 10]
+
+outputs_root: "outputs"
