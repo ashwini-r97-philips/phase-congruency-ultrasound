@@ -1,8 +1,9 @@
 dataset:
   hf_path: "haifan-gong/TN3K"
-  local_root: null                        # set to local path to bypass HF
-  use_official_split: false               # true only when local_root has train/test dirs
-  train_val_test_split: [0.75, 0.10, 0.15]
+  local_root: "/data/ThyroidDataset/tn3k"  # path to local TN3K directory
+  use_official_split: true                  # true = use local fold JSON; false = fallback to HF
+  fold: 0                                   # which fold JSON to use (0-3)
+  train_val_test_split: [0.75, 0.10, 0.15]  # only used when falling back to HF
   random_seed: 42
   image_size: [256, 256]
   num_workers: 2

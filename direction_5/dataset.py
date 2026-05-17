@@ -2,6 +2,7 @@
 
 import os
 import re
+import json
 import random
 from pathlib import Path
 
@@ -88,30 +89,79 @@ def load_tn3k_from_hf(cfg):
 
 # ── Local disk loader ─────────────────────────────────────────────────────────
 
+def _find_file(directory, stem):
+    """Find a file in `directory` whose stem matches `stem`, any extension."""
+    for p in directory.iterdir():
+        if p.stem == str(stem):
+            return p
+    return None
+
+
 def load_tn3k_from_local(cfg):
-    """Load TN3K from local directory.
+    """Load TN3K from the official local layout:
 
-    Expected layout:
       local_root/
-        train/image/*.jpg   train/mask/*.jpg
-        test/image/*.jpg    test/mask/*.jpg
+        trainval-image/   <id>.png   (ids from fold JSON "train" + "val" lists)
+        trainval-mask/    <id>.png
+        test-image/       <id>.png   (fixed held-out test set)
+        test-mask/        <id>.png
+        tn3k_trainval_fold{N}.json   (keys: "train", "val", "test")
 
-    Returns dict keyed by split name, each value is (image_path_list, mask_path_list).
+    Returns dict:
+      {
+        "train": (img_path_list, mask_path_list),
+        "val":   (img_path_list, mask_path_list),
+        "test":  (img_path_list, mask_path_list),
+      }
     """
-    root = Path(cfg["dataset"]["local_root"])
+    dcfg = cfg["dataset"]
+    root = Path(dcfg["local_root"])
+    fold = dcfg.get("fold", 0)
+
+    fold_json = root / f"tn3k_trainval_fold{fold}.json"
+    if not fold_json.exists():
+        # Try alternate naming conventions
+        candidates = list(root.glob("*fold*.json"))
+        if not candidates:
+            raise FileNotFoundError(
+                f"No fold JSON found in {root}. Expected tn3k_trainval_fold{{N}}.json"
+            )
+        fold_json = sorted(candidates)[fold] if fold < len(candidates) else candidates[0]
+        print(f"[dataset] Using fold file: {fold_json.name}")
+
+    with open(fold_json) as f:
+        splits = json.load(f)
+
+    trainval_img_dir = root / "trainval-image"
+    trainval_msk_dir = root / "trainval-mask"
+    test_img_dir = root / "test-image"
+    test_msk_dir = root / "test-mask"
+
+    def _build_items(ids, img_dir, msk_dir, split_name):
+        pairs = [(i, _find_file(img_dir, i), _find_file(msk_dir, i)) for i in ids]
+        missing = [i for i, ip, mp in pairs if ip is None or mp is None]
+        found = [(ip, mp) for _, ip, mp in pairs if ip is not None and mp is not None]
+        if missing:
+            preview = str(missing[:5]) + ("..." if len(missing) > 5 else "")
+            print(f"[dataset] WARNING: {len(missing)} missing files in '{split_name}': {preview}")
+        print(f"[dataset] Local '{split_name}': {len(found)} pairs (fold {fold})")
+        img_paths = [ip for ip, _ in found]
+        msk_paths = [mp for _, mp in found]
+        return img_paths, msk_paths
+
     result = {}
-    for split in ("train", "test"):
-        img_dir = root / split / "image"
-        msk_dir = root / split / "mask"
-        if not img_dir.exists():
-            continue
-        img_paths = sorted(img_dir.glob("*"), key=lambda p: p.stem)
-        msk_paths = sorted(msk_dir.glob("*"), key=lambda p: p.stem)
-        assert len(img_paths) == len(msk_paths), (
-            f"Image/mask count mismatch in {split}: {len(img_paths)} vs {len(msk_paths)}"
-        )
-        result[split] = (img_paths, msk_paths)
-        print(f"[dataset] Local '{split}': {len(img_paths)} pairs")
+    result["train"] = _build_items(splits["train"], trainval_img_dir, trainval_msk_dir, "train")
+    result["val"] = _build_items(splits["val"], trainval_img_dir, trainval_msk_dir, "val")
+
+    # Test set: use dedicated test-image/test-mask dirs; ignore the empty "test" key in JSON
+    test_imgs = sorted(test_img_dir.glob("*"), key=lambda p: int(p.stem) if p.stem.isdigit() else p.stem)
+    test_msks = sorted(test_msk_dir.glob("*"), key=lambda p: int(p.stem) if p.stem.isdigit() else p.stem)
+    assert len(test_imgs) == len(test_msks), (
+        f"Test image/mask count mismatch: {len(test_imgs)} vs {len(test_msks)}"
+    )
+    print(f"[dataset] Local 'test': {len(test_imgs)} pairs")
+    result["test"] = (test_imgs, test_msks)
+
     return result
 
 
@@ -199,22 +249,12 @@ def make_dataloaders(cfg_path):
 
     if dcfg.get("local_root") and dcfg.get("use_official_split"):
         splits = load_tn3k_from_local(cfg)
-        train_imgs, train_msks = splits["train"]
-        test_imgs, test_msks = splits["test"]
-
-        # Build items
-        train_items = list(zip(train_imgs, train_msks,
-                               [p.stem for p in train_imgs]))
-        test_items = list(zip(test_imgs, test_msks,
-                              [p.stem for p in test_imgs]))
-
-        # Carve a val set from train
-        val_frac = dcfg["train_val_test_split"][1]
-        n_val = max(1, int(len(train_items) * val_frac))
-        rng.shuffle(train_items)
-        val_items = train_items[:n_val]
-        train_items = train_items[n_val:]
-
+        train_items = list(zip(splits["train"][0], splits["train"][1],
+                               [p.stem for p in splits["train"][0]]))
+        val_items = list(zip(splits["val"][0], splits["val"][1],
+                             [p.stem for p in splits["val"][0]]))
+        test_items = list(zip(splits["test"][0], splits["test"][1],
+                              [p.stem for p in splits["test"][0]]))
     else:
         images, masks = load_tn3k_from_hf(cfg)
         ids = [str(i).zfill(4) for i in range(len(images))]
@@ -269,6 +309,7 @@ def get_test_items(cfg_path):
         splits = load_tn3k_from_local(cfg)
         test_imgs, test_msks = splits["test"]
         return list(zip(test_imgs, test_msks, [p.stem for p in test_imgs]))
+
     else:
         images, masks = load_tn3k_from_hf(cfg)
         ids = [str(i).zfill(4) for i in range(len(images))]
