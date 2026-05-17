@@ -24,92 +24,102 @@ def _load_cfg(cfg_path):
 
 # ── Phase congruency (scipy FFT, no external lib) ─────────────────────────────
 
-def _log_gabor(rows, cols, wavelength, sigma_on_f):
-    """Log-Gabor radial filter in the frequency domain."""
-    cy, cx = rows // 2, cols // 2
-    y, x = np.mgrid[-cy:rows - cy, -cx:cols - cx]
-    radius = np.hypot(y, x)
-    radius[cy, cx] = 1.0  # avoid log(0)
-    # Normalised radius so that center frequency = 1/wavelength
-    fo = 1.0 / wavelength
-    log_gabor = np.exp(-(np.log(radius * wavelength)) ** 2 / (2 * np.log(sigma_on_f) ** 2))
-    log_gabor[cy, cx] = 0.0
-    return log_gabor
-
-
-def _orientation_spread(rows, cols, orientation_idx, n_orientations):
-    """Orientation-selective Gaussian spread filter in frequency domain."""
-    cy, cx = rows // 2, cols // 2
-    y, x = np.mgrid[-cy:rows - cy, -cx:cols - cx]
-    # Angle of each pixel in frequency domain
-    theta = np.arctan2(y, x)
-    # Target orientation angle
-    angle = orientation_idx * np.pi / n_orientations
-    # Difference, wrapped to [-pi/2, pi/2]
-    diff = theta - angle
-    diff = np.where(np.abs(diff) < np.pi / 2, diff,
-                    diff - np.sign(diff) * np.pi)
-    # Gaussian spread
-    spread_sigma = np.pi / (n_orientations * 1.5)
-    return np.exp(-diff ** 2 / (2 * spread_sigma ** 2))
+def _lowpass_filter(rows, cols, cutoff=0.45, order=15):
+    """Butterworth low-pass to suppress aliasing near Nyquist."""
+    u1 = np.fft.ifftshift((np.arange(cols) - cols // 2) / cols)
+    u2 = np.fft.ifftshift((np.arange(rows) - rows // 2) / rows)
+    u1, u2 = np.meshgrid(u1, u2)
+    r = np.sqrt(u1 ** 2 + u2 ** 2)
+    return 1.0 / (1.0 + (r / cutoff) ** (2 * order))
 
 
 def compute_phase_congruency(image_gray, n_scales=4, n_orientations=6,
                               min_wavelength=6, mult=2.1, sigma_on_f=0.55,
-                              k=2.0, cutoff=0.5, g=10, noise_method=-1):
+                              k=2.0, cutoff=0.45):
     """
-    Kovesi phase congruency via scipy FFT.
-    Returns PC map in [0, 1] as float32.
+    Kovesi 2D phase congruency via numpy FFT.
+
+    Key implementation notes (vs common wrong versions):
+      - Frequency grid is normalized to [0, 0.5] (Nyquist = 0.5), not raw pixel radius.
+      - Log-Gabor uses log(radius/fo), not log(radius * wavelength).
+      - sum_even / sum_odd accumulated PER ORIENTATION across scales.
+      - Energy = hypot(sum_even, sum_odd) per orientation.
+      - PC_o = max(energy - noise, 0) / (sum_an + eps).
+      - Final PC = max across orientations (not sum — sum smears edges).
+      - Low-pass filter applied to suppress aliasing.
+
+    Returns float32 map in [0, 1] with thin edge responses.
     """
     rows, cols = image_gray.shape
-
-    # Pad to next power-of-2 for FFT efficiency (optional but helps speed)
     img = image_gray.astype(np.float64)
-    img_fft = np.fft.fftshift(np.fft.fft2(img))
 
-    # Accumulators
-    total_sum_an = np.zeros((rows, cols), dtype=np.float64)
-    total_energy = np.zeros((rows, cols), dtype=np.float64)
-    # For noise estimation: collect first-scale amplitudes across orientations
-    energy_list = []
+    # Standard FFT layout — NO fftshift here; frequency grid built with ifftshift below.
+    IM = np.fft.fft2(img)
 
-    for s in range(n_scales):
-        wavelength = min_wavelength * (mult ** s)
-        log_gabor = _log_gabor(rows, cols, wavelength, sigma_on_f)
+    # Normalized frequency coordinates in standard FFT order (0..0.5, wrap to -0.5..0).
+    u1 = np.fft.ifftshift((np.arange(cols) - cols // 2) / cols)
+    u2 = np.fft.ifftshift((np.arange(rows) - rows // 2) / rows)
+    u1, u2 = np.meshgrid(u1, u2)
+    radius = np.sqrt(u1 ** 2 + u2 ** 2)   # normalized: 0 at DC, 0.5 at Nyquist
+    theta = np.arctan2(-u2, u1)            # -u2 gives standard spatial-domain orientation
+    radius[0, 0] = 1.0                     # avoid log(0) at DC
 
-        for o in range(n_orientations):
-            spread = _orientation_spread(rows, cols, o, n_orientations)
-            kernel = log_gabor * spread
+    lp = _lowpass_filter(rows, cols, cutoff=cutoff, order=15)
 
-            # Filtered response in spatial domain
-            filtered = np.fft.ifft2(np.fft.ifftshift(img_fft * kernel))
-            even = filtered.real
-            odd = filtered.imag
+    # Estimate noise once from the first scale's amplitude distribution.
+    # Rayleigh estimator: tau = median(amp) / sqrt(log(4)).
+    fo0 = 1.0 / min_wavelength
+    lg0 = np.exp(-(np.log(radius / fo0)) ** 2 / (2 * np.log(sigma_on_f) ** 2))
+    lg0[0, 0] = 0.0
+    lg0 *= lp
+    resp0 = np.fft.ifft2(IM * lg0)
+    amp0 = np.hypot(resp0.real, resp0.imag)
+    tau = np.median(amp0[amp0 > 0]) / np.sqrt(np.log(4))
+    noise_threshold = tau * k * np.sqrt(2 * np.log(rows * cols))
 
-            amplitude = np.sqrt(even ** 2 + odd ** 2)
-            total_sum_an += amplitude
+    spread_sigma = np.pi / (n_orientations * 1.5)
+    pc_map = np.zeros((rows, cols), dtype=np.float64)
 
-            if s == 0:
-                energy_list.append(amplitude)
+    for o in range(n_orientations):
+        angle = o * np.pi / n_orientations
 
-            # Phase deviation: deviation from maximum response angle
-            # Maximum response: amplitude itself
-            # Phase deviation contribution: amplitude - |even|
-            # (classical Kovesi formulation)
-            total_energy += amplitude - np.abs(even - amplitude)
+        # Angular deviation from target orientation, wrapped to [0, pi/2].
+        ds = np.sin(theta) * np.cos(angle) - np.cos(theta) * np.sin(angle)
+        dc = np.cos(theta) * np.cos(angle) + np.sin(theta) * np.sin(angle)
+        dtheta = np.abs(np.arctan2(ds, dc))
+        spread = np.exp(-dtheta ** 2 / (2 * spread_sigma ** 2))
 
-    # Noise estimation (median-based)
-    if noise_method == -1:
-        # Use median of first-scale amplitudes as noise estimate
-        first_scale_amp = np.stack(energy_list, axis=0).mean(axis=0)
-        tau = np.median(first_scale_amp) / np.sqrt(np.log(4))
-        noise_threshold = tau * k * np.sqrt(2 * np.log(rows * cols))
-    else:
-        noise_threshold = noise_method
+        sum_even = np.zeros((rows, cols), dtype=np.float64)
+        sum_odd  = np.zeros((rows, cols), dtype=np.float64)
+        sum_an   = np.zeros((rows, cols), dtype=np.float64)
 
-    # Phase congruency
-    pc = np.maximum(0.0, total_energy - noise_threshold) / (total_sum_an + 1e-8)
-    return pc.astype(np.float32)
+        for s in range(n_scales):
+            fo = 1.0 / (min_wavelength * mult ** s)
+            # Log-Gabor radial component: centered at fo in normalized frequency.
+            lg = np.exp(-(np.log(radius / fo)) ** 2 / (2 * np.log(sigma_on_f) ** 2))
+            lg[0, 0] = 0.0
+            lg *= lp
+
+            kernel = lg * spread
+            response = np.fft.ifft2(IM * kernel)
+            even = response.real
+            odd  = response.imag
+            amplitude = np.hypot(even, odd)
+
+            # Accumulate per orientation across scales.
+            sum_even += even
+            sum_odd  += odd
+            sum_an   += amplitude
+
+        # Per-orientation energy (vector sum of phasors), then noise floor.
+        energy = np.hypot(sum_even, sum_odd)
+        energy_clamped = np.maximum(energy - noise_threshold, 0.0)
+        pc_o = energy_clamped / (sum_an + 1e-8)
+
+        # Max across orientations — preserves thin edge structure.
+        pc_map = np.maximum(pc_map, pc_o)
+
+    return pc_map.astype(np.float32)
 
 
 def compute_phase_congruency_from_cfg(image_gray, pc_cfg):
@@ -121,9 +131,7 @@ def compute_phase_congruency_from_cfg(image_gray, pc_cfg):
         mult=pc_cfg["mult"],
         sigma_on_f=pc_cfg["sigma_on_f"],
         k=pc_cfg["k"],
-        cutoff=pc_cfg["cutoff"],
-        g=pc_cfg["g"],
-        noise_method=pc_cfg["noise_method"],
+        cutoff=pc_cfg.get("cutoff", 0.45),
     )
 
 
@@ -139,7 +147,6 @@ def compute_sobel_map(image_gray):
 def compute_canny_soft(image_gray, sigma=2.0):
     """Canny edges dilated by 1px to allow meaningful AUC computation."""
     edges = canny(image_gray.astype(np.float64), sigma=sigma)
-    # Dilate binary map by 1px for soft comparison
     dilated = binary_dilation(edges, disk(1))
     return dilated.astype(np.float32)
 
@@ -188,7 +195,6 @@ def compute_quartile_error_rates(pc_map, error_map, band):
     result = {}
     for i in range(4):
         lo, hi = q_edges[i], q_edges[i + 1]
-        # Include upper edge only for last bin
         if i < 3:
             mask = (pc_in_band >= lo) & (pc_in_band < hi)
         else:
@@ -203,51 +209,42 @@ def compute_quartile_error_rates(pc_map, error_map, band):
 
 def analyze_single_phase(image_id, image_gray, pred_bin, gt_bin, cfg, pc_map_dir):
     """Full per-image Phase 2 analysis. Returns dict of metrics."""
-    facfg = cfg["failure_analysis"]
     pacfg = cfg["phase_analysis"]
     primary_r = pacfg["primary_band_r"]
 
-    # Compute maps
     pc_map = compute_phase_congruency_from_cfg(image_gray, pacfg["pc"])
     sobel_map = compute_sobel_map(image_gray)
     canny_map = compute_canny_soft(image_gray, sigma=pacfg["canny_sigma"])
 
-    # Save PC map
     np.save(pc_map_dir / f"{image_id}_pc.npy", pc_map)
     np.save(pc_map_dir / f"{image_id}_sobel.npy", sobel_map)
     np.save(pc_map_dir / f"{image_id}_canny.npy", canny_map)
 
-    # Boundary band for primary radius
     band = make_boundary_band(gt_bin.astype(bool), primary_r)
-    gt_boundary = band  # used as GT boundary target for AUC
-
-    # Error map
     error = (pred_bin.astype(bool) ^ gt_bin.astype(bool))
 
-    # AUC: does PC/Sobel/Canny predict boundary pixels?
-    auc_pc_boundary = compute_auc(pc_map, gt_boundary)
-    auc_sobel_boundary = compute_auc(sobel_map, gt_boundary)
-    auc_canny_boundary = compute_auc(canny_map, gt_boundary)
+    auc_pc_boundary    = compute_auc(pc_map, band)
+    auc_sobel_boundary = compute_auc(sobel_map, band)
+    auc_canny_boundary = compute_auc(canny_map, band)
 
-    # AUC: does PC/Sobel predict errors within the boundary band?
     error_in_band = error & band
-    auc_pc_error_band = compute_auc(pc_map[band], error_in_band[band].astype(int)) if band.sum() > 0 else float("nan")
+    auc_pc_error_band    = compute_auc(pc_map[band], error_in_band[band].astype(int)) if band.sum() > 0 else float("nan")
     auc_sobel_error_band = compute_auc(sobel_map[band], error_in_band[band].astype(int)) if band.sum() > 0 else float("nan")
 
-    # Zone stats
     zone = compute_zone_stats(pc_map, gt_bin, band)
-
-    # Quartile error rates
     quartile = compute_quartile_error_rates(pc_map, error, band)
+
+    def _fmt(v):
+        return round(float(v), 5) if not (isinstance(v, float) and np.isnan(v)) else "nan"
 
     result = {
         "image_id": image_id,
-        "auc_pc_boundary": round(float(auc_pc_boundary), 5) if not np.isnan(auc_pc_boundary) else "nan",
-        "auc_sobel_boundary": round(float(auc_sobel_boundary), 5) if not np.isnan(auc_sobel_boundary) else "nan",
-        "auc_canny_boundary": round(float(auc_canny_boundary), 5) if not np.isnan(auc_canny_boundary) else "nan",
-        "auc_pc_error_band5": round(float(auc_pc_error_band), 5) if not np.isnan(auc_pc_error_band) else "nan",
-        "auc_sobel_error_band5": round(float(auc_sobel_error_band), 5) if not np.isnan(auc_sobel_error_band) else "nan",
-        **{k: (round(v, 5) if v != "nan" else "nan") for k, v in zone.items()},
+        "auc_pc_boundary":      _fmt(auc_pc_boundary),
+        "auc_sobel_boundary":   _fmt(auc_sobel_boundary),
+        "auc_canny_boundary":   _fmt(auc_canny_boundary),
+        "auc_pc_error_band5":   _fmt(auc_pc_error_band),
+        "auc_sobel_error_band5":_fmt(auc_sobel_error_band),
+        **{k: (_fmt(v) if v != "nan" else "nan") for k, v in zone.items()},
         **quartile,
     }
     return result
@@ -271,7 +268,7 @@ def run_phase_analysis(cfg_path):
     for batch in test_loader:
         image_id = batch["id"][0]
         image_np = batch["image"].numpy()[0, 0]  # [H, W] float32 in [0,1]
-        gt_mask = batch["mask"].numpy()[0, 0]    # [H, W]
+        gt_mask  = batch["mask"].numpy()[0, 0]   # [H, W]
 
         pred_path = pred_dir / f"{image_id}_pred.png"
         if not pred_path.exists():
@@ -280,7 +277,7 @@ def run_phase_analysis(cfg_path):
 
         pred_256 = np.array(Image.open(pred_path))
         pred_bin = pred_256 > 127
-        gt_bin = gt_mask > 0.5
+        gt_bin   = gt_mask > 0.5
 
         result = analyze_single_phase(image_id, image_np, pred_bin, gt_bin, cfg, pc_map_dir)
         rows.append(result)
@@ -290,7 +287,6 @@ def run_phase_analysis(cfg_path):
         print("[phase] No results — did you run evaluate.py first?")
         return None
 
-    # Save CSV
     out_path = metrics_dir / "phase_metrics.csv"
     with open(out_path, "w", newline="") as f:
         writer = csv.DictWriter(f, fieldnames=rows[0].keys())
@@ -327,14 +323,13 @@ def _print_summary(rows):
         key = f"q{q}_err_rate"
         print(f"  Q{q}: {_mean([r[key] for r in rows]):.4f}")
 
-    # Interpretation
     q1 = _mean([r["q1_err_rate"] for r in rows])
     q4 = _mean([r["q4_err_rate"] for r in rows])
     print("\n--- Failure pattern interpretation ---")
     if q1 > q4 + 0.05:
-        print("Pattern A: Higher error in Q1 (low PC) → AMBIGUITY hypothesis supported → suggest uncertainty-aware training")
+        print("Pattern A: Higher error in Q1 (low PC) → AMBIGUITY hypothesis → suggest uncertainty-aware training")
     elif q4 > q1 + 0.05:
-        print("Pattern B: Higher error in Q4 (high PC) → IGNORED STRUCTURE hypothesis supported → suggest phase-guided boundary loss")
+        print("Pattern B: Higher error in Q4 (high PC) → IGNORED STRUCTURE hypothesis → suggest phase-guided boundary loss")
     else:
         print("Pattern C: Mixed Q1/Q4 → HYBRID method may be needed")
 

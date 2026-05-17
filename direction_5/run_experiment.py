@@ -52,8 +52,9 @@ def main(cfg_path, phases):
         failure_path = metrics_dir / "failure_metrics.csv"
         phase_path = metrics_dir / "phase_metrics.csv"
 
-        from visualize import generate_all_panels, plot_aggregate_summary, build_gallery
+        from visualize import generate_all_panels, plot_aggregate_summary, build_gallery, plot_edge_comparison
         generate_all_panels(cfg_path)
+        plot_edge_comparison(cfg_path)
 
         if failure_path.exists() and phase_path.exists():
             failure_df = pd.read_csv(failure_path)

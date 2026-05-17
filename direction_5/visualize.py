@@ -42,68 +42,84 @@ def _load_pc(pc_dir, image_id):
     return np.load(p)
 
 
-# ── 2×4 Panel ─────────────────────────────────────────────────────────────────
+def _load_sobel(pc_dir, image_id):
+    p = pc_dir / f"{image_id}_sobel.npy"
+    return np.load(p) if p.exists() else None
+
+
+def _load_canny(pc_dir, image_id):
+    p = pc_dir / f"{image_id}_canny.npy"
+    return np.load(p) if p.exists() else None
+
+
+def _edge_overlay(ax, image, edge_map, color, title, percentile=90):
+    """Show thresholded edge map over grayscale image."""
+    ax.imshow(image, cmap="gray", vmin=0, vmax=1)
+    if edge_map.dtype == bool or edge_map.max() <= 1.0:
+        edges = edge_map > 0.5
+    else:
+        edges = edge_map > np.percentile(edge_map, percentile)
+    ov = np.zeros((*image.shape, 4))
+    ov[edges, :3] = color
+    ov[edges, 3] = 0.75
+    ax.imshow(ov)
+    ax.set_title(title, fontsize=9)
+    ax.axis("off")
+
+
+# ── 3×4 Panel ─────────────────────────────────────────────────────────────────
 
 def plot_panel(image_id, image, gt_mask, pred_mask, error_map, pc_map,
-               boundary_band, out_path, figsize=(20, 10), dpi=150):
+               sobel_map, canny_map, boundary_band, out_path,
+               figsize=(20, 15), dpi=150):
     """
-    2x4 diagnostic panel:
+    3x4 diagnostic panel:
     Row 1: [US image | GT overlay | Pred overlay | Error map (FP=red, FN=blue)]
-    Row 2: [PC map   | PC edges over image | Error over PC | Band+error overlay]
+    Row 2: [PC map   | PC edges   | Error over PC | Band+error overlay]
+    Row 3: [Sobel map | Sobel edges | Canny edges | PC vs GT boundary]
+    Row 3 makes the case for WHY PC is better than gradient edges.
     """
-    fig, axes = plt.subplots(2, 4, figsize=figsize)
+    fig, axes = plt.subplots(3, 4, figsize=figsize)
     fig.suptitle(f"Sample: {image_id}", fontsize=12)
+
+    red_p  = mpatches.Patch(color=[1, 0, 0],    label="FP")
+    blue_p = mpatches.Patch(color=[0, 0.3, 1],  label="FN")
+    green_p = mpatches.Patch(color=[0, 1, 0],   label="Band r=5")
 
     def _overlay(ax, img, mask, color, title, alpha=0.4):
         ax.imshow(img, cmap="gray", vmin=0, vmax=1)
-        overlay = np.zeros((*img.shape, 4))
-        overlay[mask, :3] = color
-        overlay[mask, 3] = alpha
-        ax.imshow(overlay)
+        ov = np.zeros((*img.shape, 4))
+        ov[mask, :3] = color
+        ov[mask, 3] = alpha
+        ax.imshow(ov)
         ax.set_title(title, fontsize=9)
         ax.axis("off")
 
-    # [0,0] US image
+    # ── Row 1 ──────────────────────────────────────────────────────────────────
     axes[0, 0].imshow(image, cmap="gray", vmin=0, vmax=1)
     axes[0, 0].set_title("Ultrasound", fontsize=9)
     axes[0, 0].axis("off")
 
-    # [0,1] GT overlay (green)
-    _overlay(axes[0, 1], image, gt_mask.astype(bool), [0, 1, 0], "GT Mask")
+    _overlay(axes[0, 1], image, gt_mask.astype(bool),   [0, 1, 0],    "GT Mask")
+    _overlay(axes[0, 2], image, pred_mask.astype(bool), [0, 0.5, 1],  "Prediction")
 
-    # [0,2] Pred overlay (blue)
-    _overlay(axes[0, 2], image, pred_mask.astype(bool), [0, 0.5, 1], "Prediction")
-
-    # [0,3] Error map: FP=red, FN=blue
     err_rgb = np.zeros((*image.shape, 3))
-    err_rgb[error_map == 1] = [1, 0, 0]  # FP red
-    err_rgb[error_map == 2] = [0, 0.3, 1]  # FN blue
+    err_rgb[error_map == 1] = [1, 0, 0]
+    err_rgb[error_map == 2] = [0, 0.3, 1]
     axes[0, 3].imshow(image, cmap="gray", vmin=0, vmax=1, alpha=0.5)
     axes[0, 3].imshow(np.concatenate([err_rgb, (error_map > 0).astype(float)[..., None]], axis=-1))
-    red_p = mpatches.Patch(color=[1, 0, 0], label="FP")
-    blue_p = mpatches.Patch(color=[0, 0.3, 1], label="FN")
     axes[0, 3].legend(handles=[red_p, blue_p], fontsize=7, loc="lower right")
     axes[0, 3].set_title("Error Map", fontsize=9)
     axes[0, 3].axis("off")
 
-    # [1,0] PC map
+    # ── Row 2 ──────────────────────────────────────────────────────────────────
     im = axes[1, 0].imshow(pc_map, cmap="viridis", vmin=0, vmax=pc_map.max())
     axes[1, 0].set_title("Phase Congruency", fontsize=9)
     axes[1, 0].axis("off")
     plt.colorbar(im, ax=axes[1, 0], fraction=0.046, pad=0.04)
 
-    # [1,1] PC edges (thresholded) over image
-    pc_threshold = np.percentile(pc_map, 90)
-    pc_edges = pc_map > pc_threshold
-    axes[1, 1].imshow(image, cmap="gray", vmin=0, vmax=1)
-    pc_overlay = np.zeros((*image.shape, 4))
-    pc_overlay[pc_edges, :3] = [1, 0.8, 0]
-    pc_overlay[pc_edges, 3] = 0.7
-    axes[1, 1].imshow(pc_overlay)
-    axes[1, 1].set_title("PC Edges (top 10%)", fontsize=9)
-    axes[1, 1].axis("off")
+    _edge_overlay(axes[1, 1], image, pc_map, [1, 0.8, 0], "PC Edges (top 10%)", percentile=90)
 
-    # [1,2] Error map over PC map
     axes[1, 2].imshow(pc_map, cmap="viridis", vmin=0, vmax=pc_map.max())
     err_o = np.zeros((*image.shape, 4))
     err_o[error_map == 1] = [1, 0, 0, 0.6]
@@ -112,7 +128,6 @@ def plot_panel(image_id, image, gt_mask, pred_mask, error_map, pc_map,
     axes[1, 2].set_title("Error over PC", fontsize=9)
     axes[1, 2].axis("off")
 
-    # [1,3] Boundary band + error overlay
     axes[1, 3].imshow(image, cmap="gray", vmin=0, vmax=1, alpha=0.7)
     band_o = np.zeros((*image.shape, 4))
     band_o[boundary_band.astype(bool), :3] = [0, 1, 0]
@@ -122,14 +137,184 @@ def plot_panel(image_id, image, gt_mask, pred_mask, error_map, pc_map,
     err_o2[error_map == 2] = [0, 0.3, 1, 0.7]
     axes[1, 3].imshow(band_o)
     axes[1, 3].imshow(err_o2)
-    green_p = mpatches.Patch(color=[0, 1, 0], label="Band r=5")
     axes[1, 3].legend(handles=[green_p, red_p, blue_p], fontsize=7, loc="lower right")
     axes[1, 3].set_title("Band + Error", fontsize=9)
     axes[1, 3].axis("off")
 
+    # ── Row 3: edge method comparison ─────────────────────────────────────────
+    # [2,0] Sobel magnitude map
+    if sobel_map is not None:
+        im2 = axes[2, 0].imshow(sobel_map, cmap="hot", vmin=0, vmax=sobel_map.max())
+        axes[2, 0].set_title("Sobel Magnitude", fontsize=9)
+        axes[2, 0].axis("off")
+        plt.colorbar(im2, ax=axes[2, 0], fraction=0.046, pad=0.04)
+    else:
+        axes[2, 0].axis("off")
+
+    # [2,1] Sobel edges over image
+    if sobel_map is not None:
+        _edge_overlay(axes[2, 1], image, sobel_map, [1, 0.4, 0], "Sobel Edges (top 10%)", percentile=90)
+    else:
+        axes[2, 1].axis("off")
+
+    # [2,2] Canny edges over image
+    if canny_map is not None:
+        _edge_overlay(axes[2, 2], image, canny_map, [0.2, 0.8, 0.2], "Canny Edges", percentile=50)
+    else:
+        axes[2, 2].axis("off")
+
+    # [2,3] All three edge methods overlaid on GT boundary for direct comparison
+    gt_boundary = extract_boundary(gt_mask.astype(bool))
+    gt_band_tight = binary_dilation(gt_boundary, disk(2))
+    axes[2, 3].imshow(image, cmap="gray", vmin=0, vmax=1)
+    # GT boundary: white
+    gt_ov = np.zeros((*image.shape, 4))
+    gt_ov[gt_band_tight] = [1, 1, 1, 0.6]
+    axes[2, 3].imshow(gt_ov)
+    # PC top-10%: yellow
+    pc_thr = np.percentile(pc_map, 90)
+    pc_ov = np.zeros((*image.shape, 4))
+    pc_ov[pc_map > pc_thr] = [1, 0.9, 0, 0.65]
+    axes[2, 3].imshow(pc_ov)
+    # Sobel top-10%: orange (drawn at lower alpha so PC visible)
+    if sobel_map is not None:
+        sob_thr = np.percentile(sobel_map, 90)
+        sob_ov = np.zeros((*image.shape, 4))
+        sob_ov[sobel_map > sob_thr] = [1, 0.35, 0, 0.45]
+        axes[2, 3].imshow(sob_ov)
+    # Canny: green
+    if canny_map is not None:
+        can_ov = np.zeros((*image.shape, 4))
+        can_ov[canny_map > 0.5] = [0.2, 0.9, 0.2, 0.55]
+        axes[2, 3].imshow(can_ov)
+    axes[2, 3].set_title("GT bnd(white) PC(yel) Sobel(org) Canny(grn)", fontsize=7)
+    axes[2, 3].axis("off")
+
     plt.tight_layout()
     plt.savefig(out_path, dpi=dpi, bbox_inches="tight")
     plt.close(fig)
+
+
+# ── Edge method comparison figure ────────────────────────────────────────────
+
+def plot_edge_comparison(cfg_path, n_samples=6, dpi=150):
+    """
+    Publication-style figure: for n_samples images show a 1×4 strip —
+      [Sobel edges | Canny edges | PC edges | GT boundary]
+    with per-image AUC values annotated.  Saved as edge_comparison.png.
+    Useful for arguing why PC is preferred over gradient-based methods.
+    """
+    cfg = _load_cfg(cfg_path)
+    pc_dir   = Path(cfg["phase_analysis"]["output_dir"])
+    fig_dir  = Path(cfg["visualization"]["output_dir"])
+    fig_dir.mkdir(parents=True, exist_ok=True)
+
+    try:
+        phase_df = pd.read_csv(Path(cfg["phase_analysis"]["metrics_dir"]) / "phase_metrics.csv")
+        phase_df = phase_df.apply(pd.to_numeric, errors="ignore")
+        # Pick diverse samples: high / mid / low PC AUC
+        col = "auc_pc_boundary"
+        if col in phase_df.columns:
+            valid = phase_df.dropna(subset=[col]).sort_values(col)
+            n = min(n_samples, len(valid))
+            idxs = np.linspace(0, len(valid) - 1, n, dtype=int)
+            sample_ids = valid.iloc[idxs]["image_id"].astype(str).tolist()
+        else:
+            sample_ids = phase_df["image_id"].astype(str).tolist()[:n_samples]
+    except FileNotFoundError:
+        phase_df = None
+        sample_ids = []
+
+    if not sample_ids:
+        print("[viz] edge_comparison: no phase_metrics.csv yet, skipping")
+        return
+
+    from dataset import make_dataloaders
+    loaders = make_dataloaders(cfg_path)
+    id_to_gt = {}
+    for batch in loaders["test"]:
+        iid = batch["id"][0]
+        id_to_gt[iid] = batch["mask"].numpy()[0, 0]
+
+    fig, axes = plt.subplots(len(sample_ids), 4,
+                             figsize=(4 * 4, 3.5 * len(sample_ids)))
+    if len(sample_ids) == 1:
+        axes = axes[np.newaxis, :]
+
+    col_titles = ["Sobel (gradient)", "Canny (gradient)", "Phase Congruency", "GT Boundary (target)"]
+    for col_idx, title in enumerate(col_titles):
+        axes[0, col_idx].set_title(title, fontsize=10, fontweight="bold")
+
+    for row, iid in enumerate(sample_ids):
+        gt = id_to_gt.get(iid)
+        pc_path = pc_dir / f"{iid}_pc.npy"
+        sob_path = pc_dir / f"{iid}_sobel.npy"
+        can_path = pc_dir / f"{iid}_canny.npy"
+        if not all(p.exists() for p in [pc_path, sob_path, can_path]) or gt is None:
+            for ax in axes[row]:
+                ax.axis("off")
+            continue
+
+        pc_map   = np.load(pc_path)
+        sob_map  = np.load(sob_path)
+        can_map  = np.load(can_path)
+        gt_bool  = gt > 0.5
+        gt_boundary = extract_boundary(gt_bool)
+        gt_band  = binary_dilation(gt_boundary, disk(5))
+
+        # AUC annotations from phase_df
+        def _auc_str(key):
+            if phase_df is None:
+                return ""
+            row_data = phase_df[phase_df["image_id"].astype(str) == iid]
+            if row_data.empty or key not in row_data.columns:
+                return ""
+            val = row_data.iloc[0][key]
+            return f"AUC={val:.3f}" if pd.notna(val) else ""
+
+        maps_and_info = [
+            (sob_map,  [1, 0.4, 0],   _auc_str("auc_sobel_boundary"), 90),
+            (can_map,  [0.2, 0.9, 0.2], _auc_str("auc_canny_boundary"), 50),
+            (pc_map,   [1, 0.9, 0],   _auc_str("auc_pc_boundary"),    90),
+            (None,     None,           "",                               0),
+        ]
+
+        for col_idx, (emap, color, auc_txt, pct) in enumerate(maps_and_info):
+            ax = axes[row, col_idx]
+            if col_idx == 3:
+                # GT boundary panel
+                gt_disp = np.zeros((*gt.shape, 3))
+                gt_disp[gt_bool] = [0.15, 0.15, 0.15]
+                gt_disp[gt_band] = [0.0, 0.85, 0.0]
+                ax.imshow(gt_disp)
+                ax.set_title(f"id={iid}", fontsize=7)
+            else:
+                ax.imshow(np.zeros_like(gt), cmap="gray", vmin=0, vmax=1)
+                if emap.dtype == bool or emap.max() <= 1.0:
+                    edges = emap > 0.5
+                else:
+                    edges = emap > np.percentile(emap, pct)
+                ov = np.zeros((*gt.shape, 4))
+                ov[edges, :3] = color
+                ov[edges, 3]  = 0.9
+                ax.imshow(ov)
+                # GT boundary as thin white reference line
+                gt_ref = np.zeros((*gt.shape, 4))
+                gt_ref[gt_band] = [1, 1, 1, 0.35]
+                ax.imshow(gt_ref)
+                if auc_txt:
+                    ax.text(0.03, 0.05, auc_txt, transform=ax.transAxes,
+                            fontsize=8, color="white",
+                            bbox=dict(boxstyle="round,pad=0.2", fc="black", alpha=0.5))
+            ax.axis("off")
+
+    fig.suptitle("Edge Method Comparison: Sobel / Canny / Phase Congruency vs GT Boundary\n"
+                 "(white overlay = GT boundary reference)", fontsize=10, y=1.01)
+    plt.tight_layout()
+    out = fig_dir / "edge_comparison.png"
+    plt.savefig(out, dpi=dpi, bbox_inches="tight")
+    plt.close(fig)
+    print(f"[viz] Edge comparison saved: {out}")
 
 
 # ── Aggregate summary ─────────────────────────────────────────────────────────
@@ -314,10 +499,13 @@ def generate_all_panels(cfg_path, max_panels=None):
         pred = _load_pred(pred_dir, iid)
         error = _load_error(pred_dir, iid)
         pc = _load_pc(pc_dir, iid)
+        sobel_map = _load_sobel(pc_dir, iid)
+        canny_map = _load_canny(pc_dir, iid)
         band = make_boundary_band(gt.astype(bool), 5)
 
         out_path = fig_dir / f"panel_{iid}.png"
-        plot_panel(iid, img, gt.astype(bool), pred, error, pc, band, out_path, figsize, dpi)
+        plot_panel(iid, img, gt.astype(bool), pred, error, pc,
+                   sobel_map, canny_map, band, out_path, figsize, dpi)
 
         count += 1
         if max_panels and count >= max_panels:
@@ -335,6 +523,7 @@ if __name__ == "__main__":
     metrics_dir = cfg["evaluation"]["metrics_dir"]
 
     generate_all_panels(cfg_path, max_panels=max_p)
+    plot_edge_comparison(cfg_path)
 
     try:
         failure_df = pd.read_csv(Path(metrics_dir) / "failure_metrics.csv")
